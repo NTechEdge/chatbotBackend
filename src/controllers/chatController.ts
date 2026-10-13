@@ -1,0 +1,470 @@
+import { Request, Response } from 'express'
+import mongoose from 'mongoose'
+import { Chat, type IMessage, type IAttachment } from '../models/Chat.js'
+import { processAttachments, type ReceivedAttachment } from '../utils/fileExtractor.js'
+
+// In-memory fallback store if MongoDB is offline during testing
+// Keyed by `${userId}:${conversationId}` so chats stay isolated per user
+interface MemoryConversation {
+  conversationId: string
+  title: string
+  messages: IMessage[]
+  createdAt: Date
+  updatedAt: Date
+}
+const memoryStore: Map<string, MemoryConversation> = new Map()
+
+function memoryKey(userId: unknown, conversationId: string): string {
+  return `${String(userId)}:${conversationId}`
+}
+
+/**
+ * Helper to call the external AI API using credentials from .env
+ */
+async function fetchAIReply(
+  prompt: string,
+  history: IMessage[] = [],
+  imageUrls: string[] = []
+): Promise<string> {
+  const apiKey = process.env.AI_API_KEY?.trim()
+  const apiUrl = process.env.AI_API_URL?.trim() || 'https://api.openai.com/v1/chat/completions'
+  const model = process.env.AI_MODEL?.trim() || 'gpt-4o-mini'
+
+  // If no API key is provided, return guidance message
+  if (!apiKey) {
+    return `Hello! (Note: AI_API_KEY is empty in backend/.env). To get real AI responses, please paste your API key in backend/.env.\n\nYour message was: "${prompt}".`
+  }
+
+  try {
+    // 1. Anthropic Claude API format
+    if (apiUrl.includes('anthropic.com')) {
+      const claudeContent: Array<{ type: string; text?: string; source?: any }> = [
+        { type: 'text', text: prompt },
+      ]
+
+      for (const imgUrl of imageUrls) {
+        const match = imgUrl.match(/^data:([^;]+);base64,(.+)$/)
+        if (match) {
+          claudeContent.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: match[1],
+              data: match[2],
+            },
+          })
+        }
+      }
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: model || 'claude-3-5-sonnet-20241022',
+          max_tokens: 2048,
+          messages: [{ role: 'user', content: claudeContent }],
+        }),
+      })
+
+      if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`Claude API error (${response.status}): ${errText}`)
+      }
+
+      const data = (await response.json()) as { content?: Array<{ text?: string }> }
+      return data.content?.[0]?.text || 'No response returned from Claude API.'
+    }
+
+    // 2. Google Gemini API format
+    if (apiUrl.includes('generativelanguage.googleapis.com')) {
+      const urlWithKey = apiUrl.includes('key=') ? apiUrl : `${apiUrl}?key=${apiKey}`
+      const geminiParts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [
+        { text: prompt },
+      ]
+
+      for (const imgUrl of imageUrls) {
+        const match = imgUrl.match(/^data:([^;]+);base64,(.+)$/)
+        if (match) {
+          geminiParts.push({
+            inline_data: {
+              mime_type: match[1],
+              data: match[2],
+            },
+          })
+        }
+      }
+
+      const response = await fetch(urlWithKey, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: geminiParts }],
+        }),
+      })
+
+      if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`Gemini API error (${response.status}): ${errText}`)
+      }
+
+      const data = (await response.json()) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+      }
+      return (
+        data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response returned from Gemini API.'
+      )
+    }
+
+    // 3. Cohere Command API format
+    if (apiUrl.includes('api.cohere.com')) {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: model || 'command-r-plus',
+          messages: [
+            ...history.slice(-6).map((m) => ({
+              role: m.sender === 'user' ? 'user' : 'assistant',
+              content: { type: 'text', text: m.content },
+            })),
+            { role: 'user', content: { type: 'text', text: prompt } },
+          ],
+        }),
+      })
+
+      if (!response.ok) {
+        const errText = await response.text()
+        throw new Error(`Cohere API error (${response.status}): ${errText}`)
+      }
+
+      const data = (await response.json()) as {
+        message?: { content?: Array<{ text?: string }> }
+        text?: string
+      }
+      return data.message?.content?.[0]?.text || data.text || 'No text generated by Cohere.'
+    }
+
+    // 4. Default: OpenAI / OpenRouter / Groq / DeepSeek / Standard chat completions format
+    const recentHistory = history
+      .filter(
+        (m) =>
+          !m.content.startsWith('[AI API Error]') &&
+          !m.content.startsWith('⚠️ [Error]') &&
+          m.content.trim().length > 0
+      )
+      .slice(-6)
+      .map((m) => ({
+        role: m.sender === 'user' ? 'user' : 'assistant',
+        content: m.content,
+      }))
+
+    // Construct user content (supports multimodal vision array)
+    const userMessageContent =
+      imageUrls.length > 0
+        ? [
+            { type: 'text', text: prompt },
+            ...imageUrls.map((url) => ({
+              type: 'image_url',
+              image_url: { url },
+            })),
+          ]
+        : prompt
+
+    const requestBody = {
+      model,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are Nixa, a friendly, intelligent, and articulate AI assistant created by NTechEdge. Always provide natural, polite, grammatically correct, and helpful responses based on the user prompt and any attached documents or images. Respond in the language the user addresses you in (English, Bengali, etc.).',
+        },
+        ...recentHistory,
+        { role: 'user', content: userMessageContent },
+      ],
+      temperature: 0.7,
+      max_tokens: 2048,
+      stream: false,
+    }
+
+    let response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'HTTP-Referer': 'http://localhost:5001',
+        'X-Title': 'Nixa Chatbot',
+      },
+      body: JSON.stringify(requestBody),
+    })
+
+    // If model rejected multimodal array (some text-only models return 400 when receiving image_url array), fallback gracefully to text
+    if (!response.ok && imageUrls.length > 0) {
+      console.warn(`[AI Vision Fallback] Provider failed with status ${response.status}, retrying as text-only prompt...`)
+      const fallbackPrompt = `${prompt}\n\n[Note: User attached ${imageUrls.length} image file(s).]`
+      response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'HTTP-Referer': 'http://localhost:5001',
+          'X-Title': 'Nixa Chatbot',
+        },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: [
+            requestBody.messages[0],
+            ...recentHistory,
+            { role: 'user', content: fallbackPrompt },
+          ],
+        }),
+      })
+    }
+
+    if (!response.ok) {
+      const errText = await response.text()
+      throw new Error(`AI Provider API error (${response.status}): ${errText}`)
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>
+      text?: string
+      response?: string
+      output?: string
+      reply?: string
+    }
+
+    return (
+      data.choices?.[0]?.message?.content ||
+      data.text ||
+      data.response ||
+      data.output ||
+      data.reply ||
+      'No text generated by AI.'
+    )
+  } catch (error) {
+    console.error('[AI Provider Request Failed]:', (error as Error).message)
+    return `[AI API Error]: ${(error as Error).message}`
+  }
+}
+
+/**
+ * 1. POST /api/chat/message
+ * Send a message and get an AI response (supports PDF, Doc, and Image attachments)
+ * Body: { message: string, attachments?: ReceivedAttachment[], conversationId?: string }
+ */
+export const sendMessage = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { message, attachments, conversationId } = req.body as {
+      message?: string
+      attachments?: ReceivedAttachment[]
+      conversationId?: string
+    }
+
+    const hasText = message && typeof message === 'string' && message.trim().length > 0
+    const hasAttachments = Array.isArray(attachments) && attachments.length > 0
+
+    if (!hasText && !hasAttachments) {
+      res.status(400).json({
+        success: false,
+        error: 'Message text or attachment is required.',
+      })
+      return
+    }
+
+    const currentConvId = conversationId?.trim() || `conv-${Date.now()}`
+    const rawMessage = (message || '').trim()
+    const userId = req.user!._id
+
+    // 1. Process attachments (extract text from PDFs/docs, prepare images)
+    const processedAttachments = await processAttachments(attachments || [])
+
+    const imageUrls = processedAttachments
+      .filter((a) => a.isImage && a.imageUrl)
+      .map((a) => a.imageUrl as string)
+
+    const docTexts = processedAttachments.filter((a) => !a.isImage && a.extractedText)
+
+    // 2. Build rich prompt with document context
+    let promptForAI = rawMessage
+    if (docTexts.length > 0) {
+      const docsContext = docTexts
+        .map((d) => `=== Attached Document: ${d.name} ===\n${d.extractedText}\n==============================`)
+        .join('\n\n')
+
+      promptForAI = `${docsContext}\n\nUser Question/Instruction:\n${rawMessage || 'Please analyze, summarize, and extract key information from the attached document(s).'}`
+    } else if (!rawMessage && imageUrls.length > 0) {
+      promptForAI = 'Please examine this image and explain what you see in detail.'
+    }
+
+    // 3. Determine conversation title
+    const firstAttName = attachments?.[0]?.name
+    const title = rawMessage
+      ? (rawMessage.length > 30 ? `${rawMessage.slice(0, 30)}...` : rawMessage)
+      : (firstAttName || 'Document analysis')
+
+    // 4. Build saved user message object
+    const savedAttachments: IAttachment[] = (attachments || []).map((att) => ({
+      name: att.name,
+      size: att.size,
+      type: att.type,
+      url: att.url || att.base64,
+    }))
+
+    const userMsg: IMessage = {
+      sender: 'user',
+      content: rawMessage || `[Attached ${attachments?.length || 1} file(s)]`,
+      timestamp: new Date(),
+      attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
+    }
+
+    // If MongoDB is connected
+    if (mongoose.connection.readyState === 1) {
+      let chat = await Chat.findOne({ user: userId, conversationId: currentConvId })
+      const previousMessages = chat ? chat.messages : []
+
+      // Call External AI API with document context and images
+      const aiReplyText = await fetchAIReply(promptForAI, previousMessages, imageUrls)
+
+      const assistantMsg: IMessage = {
+        sender: 'assistant',
+        content: aiReplyText,
+        timestamp: new Date(),
+      }
+
+      if (!chat) {
+        chat = new Chat({
+          user: userId,
+          conversationId: currentConvId,
+          title,
+          messages: [userMsg, assistantMsg],
+        })
+      } else {
+        chat.messages.push(userMsg, assistantMsg)
+      }
+
+      await chat.save()
+
+      res.status(200).json({
+        success: true,
+        conversationId: chat.conversationId,
+        title: chat.title,
+        reply: assistantMsg.content,
+        messages: chat.messages,
+      })
+      return
+    }
+
+    // In-memory fallback
+    const memKey = memoryKey(userId, currentConvId)
+    let memoryChat = memoryStore.get(memKey)
+    const previousMessages = memoryChat ? memoryChat.messages : []
+
+    // Call External AI API
+    const aiReplyText = await fetchAIReply(promptForAI, previousMessages, imageUrls)
+
+    const assistantMsg: IMessage = {
+      sender: 'assistant',
+      content: aiReplyText,
+      timestamp: new Date(),
+    }
+
+    if (!memoryChat) {
+      memoryChat = {
+        conversationId: currentConvId,
+        title,
+        messages: [userMsg, assistantMsg],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }
+    } else {
+      memoryChat.messages.push(userMsg, assistantMsg)
+      memoryChat.updatedAt = new Date()
+    }
+    memoryStore.set(memKey, memoryChat)
+
+    res.status(200).json({
+      success: true,
+      conversationId: memoryChat.conversationId,
+      title: memoryChat.title,
+      reply: assistantMsg.content,
+      messages: memoryChat.messages,
+      notice: 'Storage: in-memory (connect MongoDB to persist permanently)',
+    })
+  } catch (error) {
+    console.error('[ChatController] Error in sendMessage:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error while processing message.',
+    })
+  }
+}
+
+/**
+ * 2. GET /api/chat/history
+ * Fetch conversation history
+ * Query params: ?conversationId=xxx (optional)
+ */
+export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { conversationId } = req.query
+    const userId = req.user!._id
+
+    // If MongoDB is connected
+    if (mongoose.connection.readyState === 1) {
+      if (conversationId && typeof conversationId === 'string') {
+        const chat = await Chat.findOne({ user: userId, conversationId })
+        if (!chat) {
+          res.status(404).json({ success: false, error: 'Conversation not found.' })
+          return
+        }
+        res.status(200).json({
+          success: true,
+          conversation: chat,
+        })
+        return
+      }
+
+      const allChats = await Chat.find({ user: userId }).sort({ updatedAt: -1 }).limit(50)
+      res.status(200).json({
+        success: true,
+        count: allChats.length,
+        conversations: allChats,
+      })
+      return
+    }
+
+    // In-memory fallback
+    if (conversationId && typeof conversationId === 'string') {
+      const chat = memoryStore.get(memoryKey(userId, conversationId))
+      if (!chat) {
+        res.status(404).json({ success: false, error: 'Conversation not found in memory.' })
+        return
+      }
+      res.status(200).json({ success: true, conversation: chat })
+      return
+    }
+
+    const allMemoryChats = Array.from(memoryStore.entries())
+      .filter(([key]) => key.startsWith(`${String(userId)}:`))
+      .map(([, chat]) => chat)
+      .reverse()
+    res.status(200).json({
+      success: true,
+      count: allMemoryChats.length,
+      conversations: allMemoryChats,
+    })
+  } catch (error) {
+    console.error('[ChatController] Error in getChatHistory:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error while fetching history.',
+    })
+  }
+}
