@@ -11,18 +11,57 @@ dotenv.config()
 const app = express()
 const PORT = process.env.PORT || 5001
 
-const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174'
-const allowedOrigins = CLIENT_URL.split(',').map((url) => url.trim())
+// Helper to strip quotes, trailing slashes, and whitespace
+function normalizeOrigin(url: string): string {
+  return url.trim().replace(/^['"]|['"]$/g, '').replace(/\/+$/, '')
+}
+
+const defaultOrigins = [
+  'https://nixa-chat-bot.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+]
+
+const envOrigins = (process.env.CLIENT_URL || '')
+  .split(',')
+  .map(normalizeOrigin)
+  .filter(Boolean)
+
+const allowedOrigins = Array.from(new Set([...defaultOrigins, ...envOrigins]))
+
+const corsOptions: cors.CorsOptions = {
+  origin: (requestOrigin, callback) => {
+    // Allow server-to-server, curl, Postman, health checks (no origin header)
+    if (!requestOrigin) {
+      return callback(null, true)
+    }
+
+    const normalized = normalizeOrigin(requestOrigin)
+
+    // Allow explicitly defined origins or Vercel preview deployments for nixa-chat-bot
+    const isAllowed =
+      allowedOrigins.includes(normalized) ||
+      /^https:\/\/nixa-chat-bot(-[a-z0-9-]+)?\.vercel\.app$/i.test(normalized)
+
+    if (isAllowed) {
+      callback(null, true)
+    } else {
+      console.warn(`[CORS Blocked] Request origin "${requestOrigin}" is not allowed.`)
+      callback(null, false)
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['Set-Cookie'],
+  optionsSuccessStatus: 204,
+}
 
 // Middlewares
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  })
-)
+app.use(cors(corsOptions))
+app.options('*', cors(corsOptions))
 app.use(express.json({ limit: '25mb' }))
 app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
