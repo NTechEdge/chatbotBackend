@@ -1,4 +1,4 @@
-import { Request, Response } from 'express'
+import type { Request, Response as ExpressResponse } from 'express'
 import mongoose from 'mongoose'
 import { Chat, type IMessage, type IAttachment } from '../models/Chat.js'
 import { processAttachments, type ReceivedAttachment } from '../utils/fileExtractor.js'
@@ -259,7 +259,7 @@ async function fetchAIReply(
  * Send a message and get an AI response (supports PDF, Doc, and Image attachments)
  * Body: { message: string, attachments?: ReceivedAttachment[], conversationId?: string }
  */
-export const sendMessage = async (req: Request, res: Response): Promise<void> => {
+export const sendMessage = async (req: Request, res: ExpressResponse): Promise<void> => {
   try {
     const { message, attachments, conversationId } = req.body as {
       message?: string
@@ -411,7 +411,7 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
  * Fetch conversation history
  * Query params: ?conversationId=xxx (optional)
  */
-export const getChatHistory = async (req: Request, res: Response): Promise<void> => {
+export const getChatHistory = async (req: Request, res: ExpressResponse): Promise<void> => {
   try {
     const { conversationId } = req.query
     const userId = req.user!._id
