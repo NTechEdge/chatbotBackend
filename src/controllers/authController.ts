@@ -1,4 +1,5 @@
 import type { Request, Response } from 'express'
+import mongoose from 'mongoose'
 import { User, type IUser } from '../models/User.js'
 import { Chat } from '../models/Chat.js'
 import { signToken } from '../middleware/auth.js'
@@ -19,6 +20,17 @@ interface AuthRequestBody {
 }
 
 const EMAIL_REGEX = /^\S+@\S+\.\S+$/
+
+function isDbConnected(): boolean {
+  return mongoose.connection.readyState === 1
+}
+
+function sendDbUnavailable(res: Response): void {
+  res.status(503).json({
+    success: false,
+    error: 'Database connection is unavailable. Please verify MONGODB_URI and MongoDB Atlas network access (0.0.0.0/0).',
+  })
+}
 
 function publicUser(user: IUser) {
   return {
@@ -46,6 +58,11 @@ function sendAuthResponse(res: Response, user: IUser, statusCode: number, messag
  */
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (!isDbConnected()) {
+      sendDbUnavailable(res)
+      return
+    }
+
     const { name, email, password } = (req.body || {}) as AuthRequestBody
 
     if (!name?.trim() || !email?.trim() || !password) {
@@ -91,6 +108,11 @@ export const register = async (req: Request, res: Response): Promise<void> => {
  */
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
+    if (!isDbConnected()) {
+      sendDbUnavailable(res)
+      return
+    }
+
     const { email, password } = (req.body || {}) as AuthRequestBody
 
     if (!email?.trim() || !password) {

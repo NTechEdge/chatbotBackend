@@ -1,6 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import mongoose from 'mongoose'
 import { connectDB } from './config/db.js'
 import chatRoutes from './routes/chatRoutes.js'
 import authRoutes from './routes/authRoutes.js'
@@ -20,8 +21,12 @@ const defaultOrigins = [
   'https://nixa-chat-bot.vercel.app',
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:5175',
+  'http://localhost:3000',
   'http://127.0.0.1:5173',
   'http://127.0.0.1:5174',
+  'http://127.0.0.1:5175',
+  'http://127.0.0.1:3000',
 ]
 
 const envOrigins = (process.env.CLIENT_URL || '')
@@ -40,10 +45,14 @@ const corsOptions: cors.CorsOptions = {
 
     const normalized = normalizeOrigin(requestOrigin)
 
-    // Allow explicitly defined origins or Vercel preview deployments for nixa-chat-bot
+    // Allow explicitly defined origins, any *.vercel.app domain (production or preview), or local development
+    const isVercelDomain = /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.vercel\.app$/i.test(normalized)
+    const isLocalhost = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(normalized)
+
     const isAllowed =
       allowedOrigins.includes(normalized) ||
-      /^https:\/\/nixa-chat-bot(-[a-z0-9-]+)?\.vercel\.app$/i.test(normalized)
+      isVercelDomain ||
+      isLocalhost
 
     if (isAllowed) {
       callback(null, true)
@@ -65,9 +74,38 @@ app.options('*', cors(corsOptions))
 app.use(express.json({ limit: '25mb' }))
 app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
-// Health check endpoint
+// Ensure MongoDB is connected for incoming serverless invocations
+app.use(async (_req, _res, next) => {
+  try {
+    await connectDB()
+  } catch (err) {
+    console.error('[DB Middleware] Connection error:', err)
+  }
+  next()
+})
+
+// Root status endpoint
+app.get('/', (_req, res) => {
+  res.status(200).json({ status: 'ok', service: 'Nixa Chatbot API', version: '1.0.0' })
+})
+
+// Health check endpoints
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'Nixa Chatbot API',
+    dbState: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+  })
+})
+
 app.get('/api/health', (_req, res) => {
-  res.status(200).json({ status: 'ok', service: 'Nixa Chatbot API', timestamp: new Date() })
+  res.status(200).json({
+    status: 'ok',
+    service: 'Nixa Chatbot API',
+    dbState: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+  })
 })
 
 // Auth API Routes
@@ -76,8 +114,13 @@ app.use('/api/auth', authRoutes)
 // Chat API Routes (JWT protected)
 app.use('/api/chat', chatRoutes)
 
-// Connect to MongoDB and start server
-connectDB().finally(() => {
+// Connect to MongoDB asynchronously without blocking server initialization
+connectDB().catch((err) => {
+  console.error('[Database] Asynchronous connection error:', err)
+})
+
+// Only listen on a port when running in a standalone Node process (not in Vercel Serverless)
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   const server = app.listen(PORT, () => {
     console.log(`🚀 [Server] Nixa Chatbot API is running on http://localhost:${PORT}`)
     console.log(`📌 [API 1] POST http://localhost:${PORT}/api/chat/message`)
@@ -91,6 +134,6 @@ connectDB().finally(() => {
       console.error('[Server Error]:', err)
     }
   })
-})
+}
 
 export default app
